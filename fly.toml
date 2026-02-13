@@ -1,6 +1,6 @@
 # fly.toml — configuration optimale pour API Flask pass-through TikTok
 
-app = "downloadit"
+app = "thevideo"
 primary_region = "iad"
 
 [build]
