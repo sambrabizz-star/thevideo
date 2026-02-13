@@ -1,15 +1,33 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import re, subprocess, os, sys, jwt, psycopg2, requests, yt_dlp
+import re
+import subprocess
+import os
+import sys
+import psycopg2
+import requests
+import yt_dlp
+import jwt
+from jwt import PyJWKClient
 from datetime import datetime, timezone
 
 app = Flask(__name__)
 app.logger.setLevel("INFO")
 
+# -----------------------------
+# CORS
+# -----------------------------
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
+@app.after_request
+def add_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+    return response
+
 # -----------------------------
-# CONFIG
+# CONFIG (Fly.io secrets)
 # -----------------------------
 DB_URL = os.environ.get("SUPABASE_DB_URL")
 JWKS_URL = os.environ.get("SUPABASE_JWKS_URL")
@@ -17,8 +35,11 @@ JWT_ISSUER = os.environ.get("SUPABASE_JWT_ISSUER")
 JWT_AUDIENCE = os.environ.get("SUPABASE_JWT_AUDIENCE", "authenticated")
 QUOTA_PER_HOUR = 30
 
-jwks_cache = None
+# -----------------------------
+# GLOBALS (lazy init)
+# -----------------------------
 db = None
+jwk_client = None
 
 # -----------------------------
 # INIT HELPERS
@@ -32,44 +53,52 @@ def get_db():
     return db
 
 
-def get_jwks():
-    global jwks_cache
-    if jwks_cache is None:
-        app.logger.info("🔑 Fetching JWKS")
-        jwks_cache = requests.get(JWKS_URL, timeout=5).json()
-    return jwks_cache
+def get_jwk_client():
+    global jwk_client
+    if jwk_client is None:
+        app.logger.info("🔑 Initializing PyJWKClient")
+        jwk_client = PyJWKClient(JWKS_URL)
+    return jwk_client
 
 
+# -----------------------------
+# AUTH
+# -----------------------------
 def verify_jwt_and_get_user():
     auth = request.headers.get("Authorization", "")
     app.logger.info(f"🔐 Authorization header present={bool(auth)}")
 
     if not auth.startswith("Bearer "):
+        app.logger.warning("❌ Missing Bearer token")
         return None
 
     token = auth.split(" ", 1)[1]
 
     try:
-        header = jwt.get_unverified_header(token)
-        jwks = get_jwks()
-        key = next(k for k in jwks["keys"] if k["kid"] == header["kid"])
+        signing_key = get_jwk_client().get_signing_key_from_jwt(token)
 
         payload = jwt.decode(
             token,
-            jwt.algorithms.RSAAlgorithm.from_jwk(key),
-            algorithms=["RS256"],
+            signing_key.key,
+            algorithms=["ES256"],   # ✅ SUPABASE USES ES256 (EC)
             audience=JWT_AUDIENCE,
             issuer=JWT_ISSUER,
         )
-        app.logger.info(f"✅ JWT OK user_id={payload['sub']}")
-        return payload["sub"]
+
+        user_id = payload.get("sub")
+        app.logger.info(f"✅ JWT verified user_id={user_id}")
+        return user_id
+
     except Exception as e:
         app.logger.error(f"❌ JWT verification failed: {e}")
         return None
 
 
+# -----------------------------
+# QUOTA
+# -----------------------------
 def increment_usage(user_id):
-    app.logger.info(f"📊 Increment usage for {user_id}")
+    app.logger.info(f"📊 Increment usage for user={user_id}")
     with get_db().cursor() as cur:
         cur.execute("""
             insert into api_usage (user_id, hour_bucket, count)
@@ -79,15 +108,19 @@ def increment_usage(user_id):
             returning count;
         """, (user_id,))
         count = cur.fetchone()[0]
-        app.logger.info(f"📈 Current count={count}")
+        app.logger.info(f"📈 Current usage count={count}")
         return count
 
 
-def is_valid_tiktok_url(url):
+# -----------------------------
+# UTILS
+# -----------------------------
+def is_valid_tiktok_url(url: str) -> bool:
     return bool(re.search(r"(vm\.tiktok\.com|tiktok\.com)", url))
 
+
 # -----------------------------
-# STREAM
+# STREAM ENDPOINT
 # -----------------------------
 @app.route("/tiktok/stream", methods=["POST", "OPTIONS"])
 def tiktok_stream():
@@ -102,8 +135,15 @@ def tiktok_stream():
 
     count = increment_usage(user_id)
     if count > QUOTA_PER_HOUR:
+        reset_at = datetime.now(timezone.utc).replace(
+            minute=0, second=0, microsecond=0
+        )
         app.logger.warning("⛔ Quota exceeded")
-        return jsonify({"error": "Quota exceeded"}), 429
+        return jsonify({
+            "error": "Quota exceeded",
+            "limit": QUOTA_PER_HOUR,
+            "reset_at": reset_at.isoformat()
+        }), 429
 
     data = request.get_json(silent=True)
     app.logger.info(f"📦 Payload={data}")
@@ -116,14 +156,24 @@ def tiktok_stream():
         return jsonify({"error": "Invalid TikTok URL"}), 400
 
     def generate():
-        app.logger.info("🎬 Starting yt-dlp stream")
+        app.logger.info("🎬 Starting yt-dlp streaming")
         cmd = [
-            sys.executable, "-m", "yt_dlp",
-            "-f", "bv*[ext=mp4]/b[ext=mp4]",
-            "-o", "-", "--quiet", url,
+            sys.executable,
+            "-m", "yt_dlp",
+            "-f", "bv*[ext=mp4][watermark!=true]/b[ext=mp4]",
+            "-o", "-",
+            "--merge-output-format", "mp4",
+            "--no-part",
+            "--quiet",
+            url,
         ]
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1024 * 1024,
+        )
 
         try:
             while True:
@@ -133,22 +183,40 @@ def tiktok_stream():
                 yield chunk
         finally:
             stderr = process.stderr.read().decode()
+            process.stdout.close()
+            process.stderr.close()
             process.wait()
             if process.returncode != 0:
-                app.logger.error(f"yt-dlp error: {stderr}")
+                app.logger.error(f"❌ yt-dlp error: {stderr}")
             else:
-                app.logger.info("✅ Stream completed")
+                app.logger.info("✅ Stream finished")
 
     return Response(
         stream_with_context(generate()),
         content_type="video/mp4",
-        headers={"Cache-Control": "no-store"},
+        headers={
+            "Content-Disposition": "attachment; filename=tiktok.mp4",
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "none",
+        },
     )
 
 
-@app.route("/health")
+# -----------------------------
+# HEALTH
+# -----------------------------
+@app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok"}
+    return jsonify({"status": "ok"})
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, threaded=True)
+
 
 
 
