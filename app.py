@@ -52,14 +52,12 @@ def get_db():
         db.autocommit = True
     return db
 
-
 def get_jwk_client():
     global jwk_client
     if jwk_client is None:
         app.logger.info("🔑 Initializing PyJWKClient")
         jwk_client = PyJWKClient(JWKS_URL)
     return jwk_client
-
 
 # -----------------------------
 # AUTH
@@ -80,7 +78,7 @@ def verify_jwt_and_get_user():
         payload = jwt.decode(
             token,
             signing_key.key,
-            algorithms=["ES256"],   # ✅ SUPABASE USES ES256 (EC)
+            algorithms=["ES256"],   # Supabase utilise ES256
             audience=JWT_AUDIENCE,
             issuer=JWT_ISSUER,
         )
@@ -92,7 +90,6 @@ def verify_jwt_and_get_user():
     except Exception as e:
         app.logger.error(f"❌ JWT verification failed: {e}")
         return None
-
 
 # -----------------------------
 # QUOTA
@@ -111,13 +108,27 @@ def increment_usage(user_id):
         app.logger.info(f"📈 Current usage count={count}")
         return count
 
-
 # -----------------------------
 # UTILS
 # -----------------------------
 def is_valid_tiktok_url(url: str) -> bool:
     return bool(re.search(r"(vm\.tiktok\.com|tiktok\.com)", url))
 
+def extract_info_and_filesize(url: str):
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+        "user_agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
+            "Mobile/15E148 Safari/604.1"
+        ),
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    filesize = info.get("filesize") or info.get("filesize_approx")
+    return info, filesize
 
 # -----------------------------
 # STREAM ENDPOINT
@@ -135,9 +146,7 @@ def tiktok_stream():
 
     count = increment_usage(user_id)
     if count > QUOTA_PER_HOUR:
-        reset_at = datetime.now(timezone.utc).replace(
-            minute=0, second=0, microsecond=0
-        )
+        reset_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         app.logger.warning("⛔ Quota exceeded")
         return jsonify({
             "error": "Quota exceeded",
@@ -154,6 +163,15 @@ def tiktok_stream():
     url = data["url"]
     if not is_valid_tiktok_url(url):
         return jsonify({"error": "Invalid TikTok URL"}), 400
+
+    # Récupération taille pour progression UI
+    try:
+        info, filesize = extract_info_and_filesize(url)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if not filesize:
+        return jsonify({"error": "Unable to determine file size"}), 500
 
     def generate():
         app.logger.info("🎬 Starting yt-dlp streaming")
@@ -176,10 +194,12 @@ def tiktok_stream():
         )
 
         try:
+            received_bytes = 0
             while True:
                 chunk = process.stdout.read(8192)
                 if not chunk:
                     break
+                received_bytes += len(chunk)
                 yield chunk
         finally:
             stderr = process.stderr.read().decode()
@@ -196,11 +216,11 @@ def tiktok_stream():
         content_type="video/mp4",
         headers={
             "Content-Disposition": "attachment; filename=tiktok.mp4",
+            "Content-Length": str(filesize),  # ← indispensable pour Flutter progression
             "Cache-Control": "no-store",
             "Accept-Ranges": "none",
         },
     )
-
 
 # -----------------------------
 # HEALTH
@@ -209,13 +229,14 @@ def tiktok_stream():
 def health():
     return jsonify({"status": "ok"})
 
-
 # -----------------------------
 # RUN
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, threaded=True)
+
+
 
 
 
