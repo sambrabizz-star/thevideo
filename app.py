@@ -4,7 +4,6 @@ import re
 import subprocess
 import os
 import sys
-import psycopg2
 from psycopg2 import pool
 import yt_dlp
 import jwt
@@ -43,7 +42,7 @@ db_pool: pool.SimpleConnectionPool | None = None
 jwk_client: PyJWKClient | None = None
 
 # --------------------------------------------------
-# INIT HELPERS
+# DB POOL
 # --------------------------------------------------
 def init_db_pool():
     global db_pool
@@ -51,20 +50,20 @@ def init_db_pool():
         app.logger.info("🔌 Initializing PostgreSQL connection pool")
         db_pool = pool.SimpleConnectionPool(
             minconn=1,
-            maxconn=20,   # ← SAFE for Supabase Free + 2 Fly machines
+            maxconn=20,   # SAFE: Supabase Free + 2 Fly machines
             dsn=DB_URL,
         )
     return db_pool
 
-
 def get_db_conn():
     return init_db_pool().getconn()
-
 
 def release_db_conn(conn):
     init_db_pool().putconn(conn)
 
-
+# --------------------------------------------------
+# JWKS
+# --------------------------------------------------
 def get_jwk_client():
     global jwk_client
     if jwk_client is None:
@@ -90,7 +89,7 @@ def verify_jwt_and_get_user():
         payload = jwt.decode(
             token,
             signing_key.key,
-            algorithms=["ES256"],   # Supabase = ES256 (EC)
+            algorithms=["ES256"],   # Supabase = ES256
             audience=JWT_AUDIENCE,
             issuer=JWT_ISSUER,
         )
@@ -104,22 +103,29 @@ def verify_jwt_and_get_user():
         return None
 
 # --------------------------------------------------
-# QUOTA
+# QUOTA (CORRIGÉ ✅)
 # --------------------------------------------------
 def increment_usage(user_id: str) -> int:
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                insert into api_usage (user_id, hour_bucket, count)
-                values (%s, date_trunc('hour', now()), 1)
-                on conflict (user_id, hour_bucket)
-                do update set count = api_usage.count + 1
-                returning count;
+                INSERT INTO api_usage (user_id, hour_bucket, count)
+                VALUES (%s, date_trunc('hour', now()), 1)
+                ON CONFLICT (user_id, hour_bucket)
+                DO UPDATE SET count = api_usage.count + 1
+                RETURNING count;
             """, (user_id,))
             count = cur.fetchone()[0]
-            app.logger.info(f"📈 Usage user={user_id} count={count}")
-            return count
+
+        conn.commit()  # 🔑 ABSOLUMENT INDISPENSABLE AVEC UN POOL
+        app.logger.info(f"📈 Usage user={user_id} count={count}")
+        return count
+
+    except Exception:
+        conn.rollback()
+        raise
+
     finally:
         release_db_conn(conn)
 
@@ -128,7 +134,6 @@ def increment_usage(user_id: str) -> int:
 # --------------------------------------------------
 def is_valid_tiktok_url(url: str) -> bool:
     return bool(re.search(r"(vm\.tiktok\.com|tiktok\.com)", url))
-
 
 def extract_info_and_filesize(url: str):
     ydl_opts = {
@@ -231,7 +236,7 @@ def tiktok_stream():
         content_type="video/mp4",
         headers={
             "Content-Disposition": "attachment; filename=tiktok.mp4",
-            "Content-Length": str(filesize),  # ← clé pour UI Flutter fluide
+            "Content-Length": str(filesize),
             "Cache-Control": "no-store",
             "Accept-Ranges": "none",
         },
@@ -250,6 +255,8 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, threaded=True)
+
+
 
 
 
