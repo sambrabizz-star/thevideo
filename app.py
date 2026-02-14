@@ -2,11 +2,13 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import re
 import subprocess
+import tempfile
 import os
 import sys
-import psycopg2
-import requests
+import shutil
 import yt_dlp
+import psycopg2
+from psycopg2 import pool
 import jwt
 from jwt import PyJWKClient
 from datetime import datetime, timezone
@@ -27,7 +29,7 @@ def add_headers(response):
     return response
 
 # -----------------------------
-# CONFIG (Fly.io secrets)
+# CONFIG
 # -----------------------------
 DB_URL = os.environ.get("SUPABASE_DB_URL")
 JWKS_URL = os.environ.get("SUPABASE_JWKS_URL")
@@ -36,22 +38,32 @@ JWT_AUDIENCE = os.environ.get("SUPABASE_JWT_AUDIENCE", "authenticated")
 QUOTA_PER_HOUR = 30
 
 # -----------------------------
-# GLOBALS (lazy init)
+# GLOBALS
 # -----------------------------
-db = None
+db_pool = None
 jwk_client = None
 
 # -----------------------------
-# INIT HELPERS
+# DATABASE POOL
 # -----------------------------
-def get_db():
-    global db
-    if db is None or db.closed != 0:
-        app.logger.info("🔌 Connecting to Supabase DB")
-        db = psycopg2.connect(DB_URL)
-        db.autocommit = True
-    return db
+def get_db_pool():
+    global db_pool
+    if db_pool is None:
+        app.logger.info("🔌 Initializing psycopg2 pool")
+        # Free plan safe: 2 machines × 10 connections → 20 max
+        db_pool = pool.SimpleConnectionPool(minconn=1, maxconn=10, dsn=DB_URL)
+    return db_pool
 
+def get_conn():
+    p = get_db_pool()
+    return p.getconn()
+
+def release_conn(conn):
+    get_db_pool().putconn(conn)
+
+# -----------------------------
+# JWKS
+# -----------------------------
 def get_jwk_client():
     global jwk_client
     if jwk_client is None:
@@ -65,28 +77,22 @@ def get_jwk_client():
 def verify_jwt_and_get_user():
     auth = request.headers.get("Authorization", "")
     app.logger.info(f"🔐 Authorization header present={bool(auth)}")
-
     if not auth.startswith("Bearer "):
         app.logger.warning("❌ Missing Bearer token")
         return None
-
     token = auth.split(" ", 1)[1]
-
     try:
         signing_key = get_jwk_client().get_signing_key_from_jwt(token)
-
         payload = jwt.decode(
             token,
             signing_key.key,
-            algorithms=["ES256"],   # Supabase utilise ES256
+            algorithms=["ES256"],
             audience=JWT_AUDIENCE,
             issuer=JWT_ISSUER,
         )
-
         user_id = payload.get("sub")
         app.logger.info(f"✅ JWT verified user_id={user_id}")
         return user_id
-
     except Exception as e:
         app.logger.error(f"❌ JWT verification failed: {e}")
         return None
@@ -95,18 +101,21 @@ def verify_jwt_and_get_user():
 # QUOTA
 # -----------------------------
 def increment_usage(user_id):
-    app.logger.info(f"📊 Increment usage for user={user_id}")
-    with get_db().cursor() as cur:
-        cur.execute("""
-            insert into api_usage (user_id, hour_bucket, count)
-            values (%s, date_trunc('hour', now()), 1)
-            on conflict (user_id, hour_bucket)
-            do update set count = api_usage.count + 1
-            returning count;
-        """, (user_id,))
-        count = cur.fetchone()[0]
-        app.logger.info(f"📈 Current usage count={count}")
-        return count
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO api_usage (user_id, hour_bucket, count)
+                VALUES (%s, date_trunc('hour', now()), 1)
+                ON CONFLICT (user_id, hour_bucket)
+                DO UPDATE SET count = api_usage.count + 1
+                RETURNING count;
+            """, (user_id,))
+            count = cur.fetchone()[0]
+            app.logger.info(f"📈 Current usage count={count}")
+            return count
+    finally:
+        release_conn(conn)
 
 # -----------------------------
 # UTILS
@@ -131,12 +140,10 @@ def extract_info_and_filesize(url: str):
     return info, filesize
 
 # -----------------------------
-# STREAM ENDPOINT
+# STREAM VIDEO
 # -----------------------------
 @app.route("/tiktok/stream", methods=["POST", "OPTIONS"])
 def tiktok_stream():
-    app.logger.info("➡️ /tiktok/stream called")
-
     if request.method == "OPTIONS":
         return "", 200
 
@@ -147,24 +154,13 @@ def tiktok_stream():
     count = increment_usage(user_id)
     if count > QUOTA_PER_HOUR:
         reset_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        app.logger.warning("⛔ Quota exceeded")
-        return jsonify({
-            "error": "Quota exceeded",
-            "limit": QUOTA_PER_HOUR,
-            "reset_at": reset_at.isoformat()
-        }), 429
+        return jsonify({"error": "Quota exceeded", "limit": QUOTA_PER_HOUR, "reset_at": reset_at.isoformat()}), 429
 
     data = request.get_json(silent=True)
-    app.logger.info(f"📦 Payload={data}")
+    url = data.get("url") if data else None
+    if not url or not is_valid_tiktok_url(url):
+        return jsonify({"error": "Invalid or missing URL"}), 400
 
-    if not data or "url" not in data:
-        return jsonify({"error": "Missing url"}), 400
-
-    url = data["url"]
-    if not is_valid_tiktok_url(url):
-        return jsonify({"error": "Invalid TikTok URL"}), 400
-
-    # Récupération taille pour progression UI
     try:
         info, filesize = extract_info_and_filesize(url)
     except Exception as e:
@@ -174,32 +170,20 @@ def tiktok_stream():
         return jsonify({"error": "Unable to determine file size"}), 500
 
     def generate():
-        app.logger.info("🎬 Starting yt-dlp streaming")
+        app.logger.info("🎬 Streaming video")
         cmd = [
-            sys.executable,
-            "-m", "yt_dlp",
+            sys.executable, "-m", "yt_dlp",
             "-f", "bv*[ext=mp4][watermark!=true]/b[ext=mp4]",
-            "-o", "-",
-            "--merge-output-format", "mp4",
-            "--no-part",
-            "--quiet",
-            url,
+            "-o", "-", "--merge-output-format", "mp4",
+            "--no-part", "--quiet",
+            url
         ]
-
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=1024 * 1024,
-        )
-
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1024*1024)
         try:
-            received_bytes = 0
             while True:
                 chunk = process.stdout.read(8192)
                 if not chunk:
                     break
-                received_bytes += len(chunk)
                 yield chunk
         finally:
             stderr = process.stderr.read().decode()
@@ -208,19 +192,96 @@ def tiktok_stream():
             process.wait()
             if process.returncode != 0:
                 app.logger.error(f"❌ yt-dlp error: {stderr}")
-            else:
-                app.logger.info("✅ Stream finished")
 
     return Response(
         stream_with_context(generate()),
         content_type="video/mp4",
         headers={
             "Content-Disposition": "attachment; filename=tiktok.mp4",
-            "Content-Length": str(filesize),  # ← indispensable pour Flutter progression
+            "Content-Length": str(filesize),
             "Cache-Control": "no-store",
             "Accept-Ranges": "none",
-        },
+        }
     )
+
+# -----------------------------
+# STREAM AUDIO MP3
+# -----------------------------
+@app.route("/tiktok/mp3", methods=["POST", "OPTIONS"])
+def tiktok_mp3():
+    if request.method == "OPTIONS":
+        return "", 200
+
+    user_id = verify_jwt_and_get_user()
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    count = increment_usage(user_id)
+    if count > QUOTA_PER_HOUR:
+        reset_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        return jsonify({"error": "Quota exceeded", "limit": QUOTA_PER_HOUR, "reset_at": reset_at.isoformat()}), 429
+
+    data = request.get_json(silent=True)
+    url = data.get("url").strip() if data else None
+    if not url or not is_valid_tiktok_url(url):
+        return jsonify({"error": "Invalid or missing URL"}), 400
+
+    temp_dir = tempfile.mkdtemp(prefix="tiktok_mp3_")
+    video_path = os.path.join(temp_dir, "video.mp4")
+    audio_path = os.path.join(temp_dir, "audio.mp3")
+
+    try:
+        # Télécharger vidéo
+        subprocess.run([
+            sys.executable, "-m", "yt_dlp",
+            "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "--no-part", "--no-playlist", "--quiet",
+            "-o", video_path, url
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+
+        if not os.path.exists(video_path) or os.path.getsize(video_path) < 1024:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({"error": "Downloaded video is empty"}), 500
+
+        # Extraire audio MP3
+        subprocess.run([
+            "ffmpeg", "-y", "-i", video_path,
+            "-vn", "-acodec", "libmp3lame", "-ab", "192k",
+            audio_path
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1024:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({"error": "MP3 extraction failed"}), 409
+
+        mp3_size = os.path.getsize(audio_path)
+
+        def generate():
+            try:
+                with open(audio_path, "rb") as f:
+                    while True:
+                        chunk = f.read(8192)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        return Response(
+            stream_with_context(generate()),
+            content_type="audio/mpeg",
+            headers={
+                "Content-Disposition": "attachment; filename=tiktok_audio.mp3",
+                "Content-Length": str(mp3_size),
+                "Cache-Control": "no-store",
+                "Accept-Ranges": "none",
+            }
+        )
+
+    except subprocess.CalledProcessError as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return jsonify({"error": "Video download or MP3 encoding failed", "details": e.stderr.decode(errors="ignore")}), 500
 
 # -----------------------------
 # HEALTH
@@ -235,6 +296,8 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, threaded=True)
+
+
 
 
 
